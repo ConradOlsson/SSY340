@@ -381,7 +381,7 @@ def main():
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     
     # Run experiment
-    run_experiment_4_semi_supervised_dbscan(
+    metrics, _ = run_experiment_4_semi_supervised_dbscan(
         data_path=args.data,
         label_fraction=args.label_fraction,
         eps=args.eps,
@@ -393,6 +393,25 @@ def main():
     
     print("\n" + "="*80)
     print("✓ DBSCAN EXPERIMENT COMPLETE!")
+    print("="*80)
+    print(f"\n📊 SUMMARY:")
+    print(f"  DBSCAN Parameters:")
+    print(f"    eps: {args.eps}")
+    print(f"    min_samples: {args.min_samples}")
+    print(f"  Clustering Results:")
+    print(f"    Clusters found: {metrics['n_clusters']}")
+    print(f"    Noise points: {metrics['n_noise']}")
+    print(f"  Pseudo-labeling:")
+    print(f"    Labeled samples: {metrics['initial_labeled']}")
+    print(f"    Pseudo-labeled: {metrics['pseudo_labeled']}")
+    print(f"    Total training: {metrics['total_training']}")
+    print(f"  Final Performance:")
+    print(f"    ⭐ Test Accuracy: {metrics['test_accuracy']:.2%}")
+    print(f"\n💡 Compare with k-NN baseline: 85.63%")
+    if metrics['test_accuracy'] > 0.8563:
+        print(f"   ✅ DBSCAN is better by {(metrics['test_accuracy'] - 0.8563)*100:.2f} percentage points!")
+    else:
+        print(f"   ⚠️  k-NN is better by {(0.8563 - metrics['test_accuracy'])*100:.2f} percentage points")
     print("="*80)
 
 
