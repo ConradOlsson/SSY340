@@ -340,18 +340,290 @@ def generate_pseudo_labels_with_model(
     return predictions, confidences
 
 
-def run_experiment_3_fully_supervised(
+def run_experiment_3_semi_supervised_dbscan(
+    data_path: str,
+    label_fraction: float = 0.1,
+    eps: float = 0.3,
+    min_samples: int = 5,
+    confidence_threshold: float = 0.6,
+    output_dir: str = "outputs/experiments",
+    config_path: str = "config.yaml"
+):
+    """
+    Experiment 3: Semi-supervised with DBSCAN clustering.
+    
+    1. Train initial model on limited labels
+    2. Use DBSCAN + k-NN to generate pseudo-labels
+    3. Retrain on labeled + pseudo-labeled data
+    
+    Args:
+        data_path: Path to labeled data CSV
+        label_fraction: Fraction of training data to use as labeled
+        eps: DBSCAN epsilon parameter
+        min_samples: DBSCAN min_samples parameter
+        confidence_threshold: Confidence threshold for pseudo-labels
+        output_dir: Directory to save results
+        config_path: Path to config file
+    """
+    print("\n" + "="*80)
+    print("EXPERIMENT 3: SEMI-SUPERVISED WITH DBSCAN")
+    print("="*80)
+    print(f"Initial labels: {label_fraction*100:.0f}% of training data")
+    print(f"DBSCAN eps: {eps}, min_samples: {min_samples}")
+    print(f"Confidence threshold: {confidence_threshold}")
+    print("="*80)
+    
+    # Initialize fine-tuner
+    fine_tuner = HateSpeechFineTuner(
+        base_model="all-MiniLM-L6-v2",
+        num_classes=3,
+        config_path=config_path
+    )
+    
+    # Load full dataset
+    train_df, val_df, test_df = fine_tuner.load_and_preprocess_data(
+        data_path=data_path,
+        test_size=0.2,
+        val_size=0.1,
+        apply_preprocessing=True,
+        balance_classes=True
+    )
+    
+    # Split into labeled and unlabeled
+    train_df_labeled, train_df_unlabeled = train_test_split(
+        train_df,
+        train_size=label_fraction,
+        random_state=42,
+        stratify=train_df['label']
+    )
+    
+    print(f"\nLabeled samples: {len(train_df_labeled)}")
+    print(f"Unlabeled samples: {len(train_df_unlabeled)}")
+    
+    # Step 1: Train initial model on labeled data
+    print("\n--- Step 1: Training initial model on labeled data ---")
+    train_examples, val_examples = fine_tuner.prepare_training_data(
+        train_df_labeled, val_df
+    )
+    
+    fine_tuner.create_model_with_classifier()
+    
+    initial_model_path = Path(output_dir) / "exp3_dbscan_initial_model"
+    fine_tuner.train(
+        train_examples=train_examples,
+        val_examples=val_examples,
+        output_path=str(initial_model_path),
+        epochs=6,
+        batch_size=32,
+        learning_rate=2e-5
+    )
+    
+    # Step 2: Generate pseudo-labels with DBSCAN
+    print("\n--- Step 2: Generating pseudo-labels with DBSCAN ---")
+    pseudo_labels, confidences, cluster_stats = generate_pseudo_labels_with_dbscan(
+        model=fine_tuner.model,
+        texts=train_df_unlabeled['text'].tolist(),
+        labeled_texts=train_df_labeled['text'].tolist(),
+        labeled_labels=train_df_labeled['label'].values,
+        eps=eps,
+        min_samples=min_samples,
+        confidence_threshold=confidence_threshold
+    )
+    
+    # Filter high-confidence predictions
+    high_conf_mask = np.array(confidences) >= confidence_threshold
+    pseudo_labeled_df = train_df_unlabeled.copy()
+    pseudo_labeled_df['label'] = pseudo_labels
+    pseudo_labeled_df = pseudo_labeled_df[high_conf_mask].reset_index(drop=True)
+    
+    print(f"High-confidence pseudo-labels: {len(pseudo_labeled_df)} / {len(train_df_unlabeled)}")
+    if high_conf_mask.sum() > 0:
+        print(f"Average confidence: {np.mean(confidences[high_conf_mask]):.4f}")
+    print(f"Pseudo-label distribution:")
+    for label in sorted(pseudo_labeled_df['label'].unique()):
+        count = (pseudo_labeled_df['label'] == label).sum()
+        print(f"  {label}: {count} samples")
+    
+    # Step 3: Combine labeled + pseudo-labeled data
+    combined_train_df = pd.concat([train_df_labeled, pseudo_labeled_df], ignore_index=True)
+    print(f"\nCombined training set: {len(combined_train_df)} samples")
+    
+    # Step 4: Retrain on combined data
+    print("\n--- Step 3: Retraining on labeled + pseudo-labeled data ---")
+    combined_train_examples, val_examples = fine_tuner.prepare_training_data(
+        combined_train_df, val_df
+    )
+    
+    # Create fresh model
+    fine_tuner.create_model_with_classifier()
+    
+    final_model_path = Path(output_dir) / "exp3_semi_supervised_dbscan"
+    fine_tuner.train(
+        train_examples=combined_train_examples,
+        val_examples=val_examples,
+        output_path=str(final_model_path),
+        epochs=6,
+        batch_size=32,
+        learning_rate=2e-5
+    )
+    
+    # Evaluate
+    metrics = fine_tuner.evaluate(test_df)
+    
+    # Save results
+    results = {
+        'experiment': 'semi_supervised_dbscan',
+        'label_fraction': label_fraction,
+        'initial_labeled': len(train_df_labeled),
+        'pseudo_labeled': len(pseudo_labeled_df),
+        'total_training': len(combined_train_df),
+        'eps': eps,
+        'min_samples': min_samples,
+        'n_clusters': cluster_stats['n_clusters'],
+        'n_noise': cluster_stats['n_noise'],
+        'silhouette': cluster_stats['silhouette'],
+        'confidence_threshold': confidence_threshold,
+        'test_samples': len(test_df),
+        **metrics
+    }
+    
+    results_df = pd.DataFrame([results])
+    results_path = Path(output_dir) / "exp3_results.csv"
+    results_df.to_csv(results_path, index=False)
+    print(f"\n✓ Results saved to: {results_path}")
+    
+    return metrics, final_model_path
+
+
+def generate_pseudo_labels_with_dbscan(
+    model: SentenceTransformer,
+    texts: list,
+    labeled_texts: list,
+    labeled_labels: np.ndarray,
+    eps: float = 0.3,
+    min_samples: int = 5,
+    confidence_threshold: float = 0.6
+) -> tuple:
+    """
+    Generate pseudo-labels using DBSCAN clustering + k-NN.
+    
+    Strategy:
+    1. Get embeddings for labeled and unlabeled data
+    2. Cluster unlabeled embeddings using DBSCAN
+    3. Use k-NN to assign labels based on nearest labeled neighbors
+    4. Boost confidence for points in coherent clusters
+    
+    Args:
+        model: Trained SentenceTransformer model
+        texts: Unlabeled texts to generate pseudo-labels for
+        labeled_texts: Labeled texts for reference
+        labeled_labels: Labels for the labeled texts
+        eps: DBSCAN epsilon parameter
+        min_samples: DBSCAN min_samples parameter
+        confidence_threshold: Minimum confidence for pseudo-labels
+        
+    Returns:
+        predictions: Predicted labels
+        confidences: Confidence scores
+        cluster_stats: Dictionary with clustering statistics
+    """
+    from sklearn.cluster import DBSCAN
+    from sklearn.neighbors import KNeighborsClassifier
+    from sklearn.metrics import silhouette_score
+    
+    print(f"Using DBSCAN (eps={eps}, min_samples={min_samples}) + k-NN...")
+    
+    # Get embeddings
+    print("Encoding labeled data...")
+    labeled_embeddings = model.encode(
+        labeled_texts,
+        batch_size=64,
+        show_progress_bar=True,
+        convert_to_numpy=True
+    )
+    
+    print("Encoding unlabeled data...")
+    unlabeled_embeddings = model.encode(
+        texts,
+        batch_size=64,
+        show_progress_bar=True,
+        convert_to_numpy=True
+    )
+    
+    # Apply DBSCAN clustering on unlabeled data
+    print("Applying DBSCAN clustering...")
+    dbscan = DBSCAN(eps=eps, min_samples=min_samples, metric='cosine')
+    cluster_labels = dbscan.fit_predict(unlabeled_embeddings)
+    
+    n_clusters = len(set(cluster_labels)) - (1 if -1 in cluster_labels else 0)
+    n_noise = list(cluster_labels).count(-1)
+    
+    print(f"Found {n_clusters} clusters")
+    print(f"Noise points: {n_noise} ({n_noise/len(cluster_labels)*100:.1f}%)")
+    
+    # Calculate silhouette score if we have clusters
+    if n_clusters > 1:
+        non_noise_mask = cluster_labels != -1
+        if non_noise_mask.sum() > 0:
+            silhouette = silhouette_score(
+                unlabeled_embeddings[non_noise_mask],
+                cluster_labels[non_noise_mask],
+                metric='cosine'
+            )
+            print(f"Silhouette score: {silhouette:.4f}")
+        else:
+            silhouette = 0.0
+    else:
+        silhouette = 0.0
+        print(f"Silhouette score: N/A (need >1 cluster)")
+    
+    # Use k-NN to assign labels
+    knn = KNeighborsClassifier(n_neighbors=5, metric='cosine')
+    knn.fit(labeled_embeddings, labeled_labels)
+    
+    predictions = knn.predict(unlabeled_embeddings)
+    proba = knn.predict_proba(unlabeled_embeddings)
+    confidences = np.max(proba, axis=1)
+    
+    # Boost confidence for points in coherent clusters
+    for cluster_id in range(n_clusters):
+        cluster_mask = cluster_labels == cluster_id
+        if cluster_mask.sum() > 0:
+            cluster_predictions = predictions[cluster_mask]
+            unique, counts = np.unique(cluster_predictions, return_counts=True)
+            cluster_purity = counts.max() / cluster_mask.sum()
+            
+            # Boost confidence based on cluster purity
+            confidences[cluster_mask] *= (0.7 + 0.3 * cluster_purity)
+    
+    # Penalize noise points
+    noise_mask = cluster_labels == -1
+    confidences[noise_mask] *= 0.5
+    
+    print(f"Confidence range: [{confidences.min():.3f}, {confidences.max():.3f}]")
+    print(f"Mean confidence: {confidences.mean():.3f}")
+    
+    cluster_stats = {
+        'n_clusters': n_clusters,
+        'n_noise': n_noise,
+        'silhouette': silhouette
+    }
+    
+    return predictions, confidences, cluster_stats
+
+
+def run_experiment_4_fully_supervised(
     data_path: str,
     output_dir: str = "outputs/experiments",
     config_path: str = "config.yaml"
 ):
     """
-    Experiment 3: Fully supervised learning (upper bound).
+    Experiment 4: Fully supervised learning (upper bound).
     
     Train on 100% of labeled data.
     """
     print("\n" + "="*80)
-    print("EXPERIMENT 3: FULLY SUPERVISED (UPPER BOUND)")
+    print("EXPERIMENT 4: FULLY SUPERVISED (UPPER BOUND)")
     print("="*80)
     print("Using 100% of training labels")
     print("="*80)
@@ -405,7 +677,7 @@ def run_experiment_3_fully_supervised(
     }
     
     results_df = pd.DataFrame([results])
-    results_path = Path(output_dir) / "exp3_results.csv"
+    results_path = Path(output_dir) / "exp4_results.csv"
     results_df.to_csv(results_path, index=False)
     print(f"\n✓ Results saved to: {results_path}")
     
@@ -422,7 +694,7 @@ def generate_comparison_report(output_dir: str):
     
     # Load all results
     results = []
-    for exp_file in ['exp1_results.csv', 'exp2_results.csv', 'exp3_results.csv']:
+    for exp_file in ['exp1_results.csv', 'exp2_results.csv', 'exp3_results.csv', 'exp4_results.csv']:
         exp_path = output_path / exp_file
         if exp_path.exists():
             df = pd.read_csv(exp_path)
@@ -510,9 +782,23 @@ def main():
     )
     
     parser.add_argument(
+        '--eps',
+        type=float,
+        default=0.3,
+        help='DBSCAN epsilon parameter (for experiment 3)'
+    )
+    
+    parser.add_argument(
+        '--min-samples',
+        type=int,
+        default=5,
+        help='DBSCAN min_samples parameter (for experiment 3)'
+    )
+    
+    parser.add_argument(
         '--experiments',
         nargs='+',
-        choices=['exp1', 'exp2', 'exp3', 'all'],
+        choices=['exp1', 'exp2', 'exp3', 'exp4', 'all'],
         default=['all'],
         help='Which experiments to run'
     )
@@ -524,7 +810,7 @@ def main():
     
     run_experiments = args.experiments
     if 'all' in run_experiments:
-        run_experiments = ['exp1', 'exp2', 'exp3']
+        run_experiments = ['exp1', 'exp2', 'exp3', 'exp4']
     
     # Run experiments
     if 'exp1' in run_experiments:
@@ -546,7 +832,18 @@ def main():
         )
     
     if 'exp3' in run_experiments:
-        run_experiment_3_fully_supervised(
+        run_experiment_3_semi_supervised_dbscan(
+            data_path=args.data,
+            label_fraction=args.label_fraction,
+            eps=args.eps,
+            min_samples=args.min_samples,
+            confidence_threshold=args.confidence_threshold,
+            output_dir=args.output_dir,
+            config_path=args.config
+        )
+    
+    if 'exp4' in run_experiments:
+        run_experiment_4_fully_supervised(
             data_path=args.data,
             output_dir=args.output_dir,
             config_path=args.config
